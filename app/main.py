@@ -9,19 +9,32 @@ identical regardless of which provider is chosen.
 
 from __future__ import annotations
 
-import json
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sse_starlette.sse import EventSourceResponse
 
 from . import retrieval
 from .config import settings
-from .models import ChatRequest
-from .providers import default_provider_id, get_provider, list_providers
-from .sessions import store
+from .db import dispose_db, init_db
+from .providers import default_provider_id, list_providers
+from .routers import audit as audit_router
+from .routers import auth as auth_router
+from .routers import chats as chats_router
+from .routers import roles as roles_router
+from .routers import users as users_router
+from .seed import seed
 
-app = FastAPI(title="BluChip Agent-Assist")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await init_db()
+    await seed()
+    yield
+    await dispose_db()
+
+
+app = FastAPI(title="BluChip Agent-Assist", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,6 +43,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router.router)
+app.include_router(users_router.router)
+app.include_router(roles_router.router)
+app.include_router(audit_router.router)
+app.include_router(chats_router.router)
 
 
 @app.get("/")
@@ -64,78 +83,3 @@ async def knowledge_stats() -> dict:
 async def reindex() -> dict:
     """Rebuild the knowledge index from disk (after adding/removing files)."""
     return retrieval.reindex()
-
-
-@app.get("/api/sessions")
-async def list_sessions() -> dict:
-    """Past conversations (newest first) for the history sidebar."""
-    return {
-        "sessions": [
-            {
-                "id": s.id,
-                "title": s.title(),
-                "created_at": s.created_at,
-                "message_count": sum(
-                    1 for t in s.transcript if t.get("role") == "user"
-                ),
-            }
-            for s in store.list()
-        ]
-    }
-
-
-@app.get("/api/sessions/{session_id}")
-async def get_session(session_id: str) -> dict:
-    """Full history of one conversation, to restore it in the UI."""
-    session = store.get(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    return {
-        "id": session.id,
-        "title": session.title(),
-        "created_at": session.created_at,
-        "transcript": session.transcript,
-        "state": session.state.model_dump(),
-    }
-
-
-@app.post("/api/chat")
-async def chat(req: ChatRequest) -> EventSourceResponse:
-    """Stream a single assistant turn as SSE (CONTRACTS §4)."""
-    session = store.get_or_create(req.session_id)
-    provider_id = req.provider or default_provider_id()
-    provider = get_provider(provider_id)
-
-    async def event_stream():
-        # Always announce the (possibly newly created) session id first.
-        yield {"event": "session", "data": json.dumps({"session_id": session.id})}
-        try:
-            if provider is None:
-                yield {
-                    "event": "error",
-                    "data": json.dumps(
-                        {"message": f"Unknown provider: {provider_id!r}"}
-                    ),
-                }
-            elif not provider.available():
-                yield {
-                    "event": "error",
-                    "data": json.dumps(
-                        {
-                            "message": f"Provider '{provider_id}' is not configured "
-                            "(missing API key)."
-                        }
-                    ),
-                }
-            else:
-                async for event in provider.stream_turn(session, req.message):
-                    yield {
-                        "event": event["event"],
-                        "data": json.dumps(event["data"]),
-                    }
-        except Exception as exc:  # noqa: BLE001 - surface any failure to the client
-            yield {"event": "error", "data": json.dumps({"message": str(exc)})}
-        finally:
-            yield {"event": "done", "data": json.dumps({"session_id": session.id})}
-
-    return EventSourceResponse(event_stream())

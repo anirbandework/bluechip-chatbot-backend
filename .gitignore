@@ -13,5 +13,8 @@ venv/
 build/
 dist/
 
+# local dev database
+*.db
+
 # OS
 .DS_Store
