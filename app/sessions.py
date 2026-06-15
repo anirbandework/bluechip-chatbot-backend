@@ -36,12 +36,22 @@ class Session:
             memory lives in ``state``/``events``, not in the transcript.
         state: The decision-panel state mirrored to the frontend (§5).
         events: Audit log appended by ``record_outcome``.
+        draft_fields: Accumulated template-field values the agent has submitted
+            via "complete the draft" cards (placeholder key -> value). Merged
+            into every render so a value is never lost if the model omits it.
     """
 
     id: str
     transcript: list[dict] = field(default_factory=list)
     state: SessionState = field(default_factory=default_session_state)
     events: list[dict] = field(default_factory=list)
+    draft_fields: dict = field(default_factory=dict)
+    # Running summary of older messages folded away by compaction, plus how many
+    # of the chat's oldest DB messages it covers. The transcript holds only the
+    # messages AFTER that boundary; the summary is injected into the model context
+    # so nothing is forgotten. Full messages always remain in the DB.
+    summary: str = ""
+    summary_msg_count: int = 0
     created_at: str = field(default_factory=_now_iso)
 
     def title(self) -> str:

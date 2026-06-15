@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from .. import db_models as dbm
+from ..config import settings
 from ..db import SessionLocal, get_session
 from ..deps import has_permission, require_permission
 from ..models import ChatRequest
@@ -21,10 +22,16 @@ from ..schemas import (
     ChatMessageOut,
     ChatOwnerStat,
     ChatSummary,
+    CompactResult,
     OwnerBrief,
     RenameChatRequest,
 )
-from ..services.chats import get_or_create_chat, load_session, persist_turn
+from ..services.chats import (
+    compact_session,
+    get_or_create_chat,
+    load_session,
+    persist_turn,
+)
 
 router = APIRouter(tags=["chats"])
 
@@ -47,6 +54,35 @@ async def chat(
     )
     await db.commit()  # persist the (possibly new) chat so its id is durable
     session = await load_session(db, chat_obj)
+    # Values submitted from a "complete the draft" card — accumulate them on the
+    # session so render_email_template always has them (the model can't drop one).
+    if req.form_fields:
+        session.draft_fields.update(
+            {
+                str(k): str(v)
+                for k, v in req.form_fields.items()
+                if v is not None and str(v) != ""
+            }
+        )
+    # Auto-compact once the (uncompacted) transcript gets long, so a never-ending
+    # chat can't overflow the context window. Best-effort: on any failure we just
+    # proceed with the full transcript. The full messages stay in the DB.
+    if (
+        settings.COMPACT_AFTER_MESSAGES
+        and provider is not None
+        and provider.available()
+        and len(session.transcript) > settings.COMPACT_AFTER_MESSAGES
+    ):
+        try:
+            folded = await compact_session(
+                db, chat_obj, session, provider,
+                keep_recent=settings.COMPACT_KEEP_RECENT,
+            )
+            if folded:
+                await db.commit()
+        except Exception:  # noqa: BLE001 — compaction must never break a turn
+            await db.rollback()
+            session = await load_session(db, chat_obj)
     prior_len = len(session.transcript)
     chat_uuid = chat_obj.id
     chat_id = str(chat_uuid)
@@ -240,7 +276,7 @@ async def get_chat(
         await db.execute(
             select(dbm.Message)
             .where(dbm.Message.chat_id == chat.id)
-            .order_by(dbm.Message.created_at)
+            .order_by(dbm.Message.created_at, dbm.Message.id)
         )
     ).scalars().all()
     state = (chat.state or {}).get("state", {}) if isinstance(chat.state, dict) else {}
@@ -258,6 +294,53 @@ async def get_chat(
             for m in msgs
         ],
         owner=owner,
+    )
+
+
+@router.post("/api/chats/{chat_id}/compact", response_model=CompactResult)
+async def compact_chat(
+    chat_id: uuid.UUID,
+    user: dbm.User = Depends(require_permission("chats.use")),
+    db: AsyncSession = Depends(get_session),
+):
+    """Manually compact a chat: fold older messages into a summary now.
+
+    The full messages stay in the DB and the chat view; only the model's context
+    is condensed (the summary is injected so nothing is forgotten).
+    """
+    chat = await _own_chat(db, user, chat_id)
+    total = (
+        await db.execute(
+            select(func.count()).select_from(dbm.Message).where(dbm.Message.chat_id == chat.id)
+        )
+    ).scalar_one()
+
+    provider_id = chat.provider or default_provider_id()
+    provider = get_provider(provider_id)
+    if provider is None or not provider.available():
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Provider '{provider_id}' is not available to summarize this chat.",
+        )
+
+    session = await load_session(db, chat)
+    try:
+        folded = await compact_session(
+            db, chat, session, provider, keep_recent=settings.COMPACT_KEEP_RECENT
+        )
+    except Exception as exc:  # noqa: BLE001
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, f"Could not summarize the chat: {exc}"
+        ) from exc
+    if folded:
+        await db.commit()
+
+    return CompactResult(
+        folded=folded,
+        kept=len(session.transcript),
+        total_messages=total,
+        has_summary=bool(session.summary),
     )
 
 

@@ -102,7 +102,7 @@ class Chat(Base):
     messages: Mapped[list["Message"]] = relationship(
         back_populates="chat",
         cascade="all, delete-orphan",
-        order_by="Message.created_at",
+        order_by="Message.created_at, Message.id",
     )
 
 

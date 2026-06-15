@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     # Hard per-request wall-clock cap so a hung Gemini call can't pin a worker.
     AI_CALL_TIMEOUT_SECONDS: int = 45
 
+    # --- chat history compaction ---
+    # Auto-compact a chat once its uncompacted transcript passes this many
+    # messages: fold all but the most recent COMPACT_KEEP_RECENT turns into a
+    # running summary kept in the model's context. The full messages ALWAYS stay
+    # in the DB (and the chat view) — only the model context is compacted. Set
+    # COMPACT_AFTER_MESSAGES = 0 to disable automatic compaction (manual still works).
+    COMPACT_AFTER_MESSAGES: int = 40
+    COMPACT_KEEP_RECENT: int = 12
+
     # --- knowledge retrieval (RAG) ---
     # Folder of reference documents (.md/.txt/.pdf) searched by `search_knowledge`.
     # Empty -> defaults to backend/knowledge_sources. Files starting with "_" or

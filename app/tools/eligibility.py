@@ -129,4 +129,21 @@ async def evaluate_merge_eligibility(tool_input: dict, session: Any) -> dict:
     )
     _apply_state(session, result, checklist)
 
+    # Deterministic terminal action the turn MUST end in (the provider enforces
+    # it so a decided case always produces its draft / escalation — never just
+    # narration). Derived from the rules' own output, so the SOP stays the single
+    # source of truth in decision_rules.
+    if result.get("recommended_template_id"):
+        result["required_followup"] = {
+            "kind": "draft",
+            "template_id": result["recommended_template_id"],
+        }
+    elif result.get("requires_program_ops_discretion"):
+        result["required_followup"] = {
+            "kind": "escalate",
+            "event": "escalated_to_ops",
+        }
+    else:
+        result["required_followup"] = None
+
     return result

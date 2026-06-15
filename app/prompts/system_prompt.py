@@ -78,6 +78,9 @@ You speak to a trained support agent, not to the end customer.
   `evaluate_merge_eligibility` or guess any fact until they submit; their answers
   arrive as the next message (labelled facts). EXCEPTION: if the agent has ALREADY
   stated the determining facts, SKIP the card and go straight to evaluate + draft.
+  NEVER call `request_intake_form` in the same turn you call
+  `evaluate_merge_eligibility` or `render_email_template`: once you have reached a
+  decision or drafted, an intake card is contradictory and will be discarded.
 - **Be proactive — draft the email as soon as the scenario is determinable, even
   from limited information. Drafting is the DEFAULT, not the last step.** The
   moment the agent's facts settle the outcome, call `evaluate_merge_eligibility`
@@ -299,6 +302,19 @@ def build_state_context(session) -> str | None:
     ``session.events`` and the model's context: without it, the model only has
     its own prose history to infer progress from.
     """
+    blocks: list[str] = []
+
+    # Compacted earlier conversation (older messages folded into a summary). This
+    # is injected so nothing is forgotten once a long chat has been compacted.
+    summary = (getattr(session, "summary", "") or "").strip()
+    if summary:
+        blocks.append(
+            "## Earlier conversation (compacted summary)\n"
+            "Older messages in this chat were summarized to save space. Treat this "
+            "as established context and continue from it — do NOT ask the agent to "
+            "repeat anything covered here.\n" + summary
+        )
+
     state = session.state
     eligibility = getattr(state, "eligibility", None)
     events = getattr(session, "events", []) or []
@@ -312,7 +328,7 @@ def build_state_context(session) -> str | None:
         or getattr(state, "escalated", False)
     )
     if not has_signal:
-        return None
+        return "\n\n".join(blocks) if blocks else None
 
     lines = [f"- Current step: {getattr(state, 'step', '—')}"]
     if eligibility:
@@ -349,10 +365,11 @@ def build_state_context(session) -> str | None:
         recent = ", ".join(ev.get("event", "") for ev in events[-8:])
         lines.append(f"- Outcomes recorded so far: {recent}")
 
-    return (
+    blocks.append(
         "## Current session state (your running record)\n"
         "Stay consistent with the facts below. Do NOT re-evaluate eligibility or "
         "re-ask the agent for facts already gathered, and do not read this block "
         "back verbatim — use it to continue the workflow from where it stands.\n"
         + "\n".join(lines)
     )
+    return "\n\n".join(blocks)

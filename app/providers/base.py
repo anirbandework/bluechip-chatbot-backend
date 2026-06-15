@@ -12,6 +12,22 @@ from __future__ import annotations
 
 from typing import Any, AsyncGenerator
 
+# System prompt for compacting a long chat into a running summary (see
+# services.chats.compact_session). The deterministic workflow state is preserved
+# separately, so this captures the conversational narrative + any loose facts.
+SUMMARY_SYSTEM_PROMPT = (
+    "You are compacting a BluChip Agent-Assist support conversation so it fits "
+    "the model's context window. Write a CONCISE but COMPLETE summary that "
+    "preserves everything needed to continue the case without the original "
+    "messages: the member's situation and any identity facts given; every fact "
+    "gathered (name match, DOB match, verification/DPA, IBC balance, co-brand "
+    "linkage, which mobile is Primary); each eligibility decision and its reason; "
+    "every email drafted (named by its plain-English purpose) and the field "
+    "values used; outcomes recorded; and any pending next action. Use tight "
+    "bullet points grouped by topic. Do NOT invent anything or add commentary. "
+    "Output only the summary."
+)
+
 # Injected as a synthetic user turn when the model decided an eligibility that
 # requires a specific email template but ended the turn without drafting it.
 # Forces the provider's tool loop to run one more round so the draft is produced
@@ -23,6 +39,19 @@ RENDER_GUARD_MESSAGE = (
     "already have (omit any you don't know — they become a fill-in card for the "
     "agent). After it renders, give the agent a short plain-language summary of "
     "the decision and that the draft is ready. Do not reply without rendering."
+)
+
+# Injected when the eligibility outcome is CONDITIONAL / requires Program Ops
+# discretion (e.g. a date-of-birth mismatch) but the model ended the turn without
+# recording the escalation. Forces the audit-trail event so the decision panel
+# and history reflect the escalation deterministically.
+ESCALATION_GUARD_MESSAGE = (
+    "SYSTEM: This outcome is CONDITIONAL and requires Program Ops discretion "
+    "(e.g. a date-of-birth mismatch), but you did NOT record the escalation. You "
+    'MUST now call record_outcome with event="escalated_to_ops" and a short '
+    "detail of why. Do NOT draft a customer denial or approval — this needs a "
+    "human Program Ops decision. Then tell the agent in plain language that the "
+    "case is escalated to Program Ops. Do not reply without recording it."
 )
 
 
@@ -69,3 +98,10 @@ class BaseProvider:
         """
         raise NotImplementedError
         yield  # pragma: no cover - marks this as an async generator
+
+    async def summarize(self, text: str) -> str:
+        """Return a concise summary of ``text`` (used to compact long chats).
+
+        Default raises; each provider implements a one-shot, non-streaming call.
+        """
+        raise NotImplementedError

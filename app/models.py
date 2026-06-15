@@ -17,6 +17,10 @@ class ChatRequest(BaseModel):
     message: str
     # Which LLM backend to use ("anthropic" | "gemini"); None = server default.
     provider: Optional[str] = None
+    # Structured values from a submitted "complete the draft" card (template
+    # field key -> value). Persisted on the session so render_email_template
+    # always has them — the model can never drop a value the agent provided.
+    form_fields: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------

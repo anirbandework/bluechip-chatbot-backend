@@ -96,6 +96,17 @@ async def render_email_template(tool_input: dict, session) -> dict:
     if not isinstance(fields, dict):
         fields = {}
 
+    # Merge in values the agent submitted via "complete the draft" cards (kept on
+    # the session). The agent's submitted values are the base; non-empty model
+    # values may override, but the model can never DROP a value the agent gave.
+    accumulated = getattr(session, "draft_fields", None) or {} if session else {}
+    if accumulated:
+        merged = dict(accumulated)
+        for key, value in fields.items():
+            if value is not None and str(value) != "":
+                merged[key] = value
+        fields = merged
+
     template = TEMPLATES.get(template_id) if template_id else None
     if template is None:
         return {

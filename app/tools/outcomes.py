@@ -12,8 +12,9 @@ Side effects on ``session.state`` (CONTRACTS section 5):
 
 * ``dpa_passed``      -> ``dpa_status = "passed"``
 * ``dpa_failed``      -> ``dpa_status = "failed"``
-* ``consent_received``-> ``consent_primary`` / ``consent_other`` set from the
-  ``detail`` text (``primary`` / ``other``; ``both`` sets both)
+* ``consent_received``-> ``consent_primary`` / ``consent_other`` set ONLY from an
+  explicit ``detail`` (``primary`` / ``other`` / ``secondary`` / ``both``); an
+  empty or ambiguous detail sets nothing (never inferred from absence)
 * ``escalated_to_ops``-> ``escalated = True``
 * every event advances the human-readable ``step`` label
 
@@ -51,18 +52,20 @@ def _get_state(state: object, field: str, default: object = None) -> object:
 def _apply_consent(state: object, detail: str) -> None:
     """Update consent flags from a ``consent_received`` event's ``detail`` text.
 
-    ``detail`` mentioning "primary" sets ``consent_primary``; "other" /
-    "secondary" sets ``consent_other``; "both" (or an empty/ambiguous detail)
-    sets both. Existing True flags are never cleared.
+    ``detail`` must say WHICH account consented: "primary" sets ``consent_primary``;
+    "other" / "secondary" sets ``consent_other``; "both" sets both. An empty or
+    ambiguous detail sets NOTHING — consent is a load-bearing audit fact and must
+    never be inferred from absence (over-recording "both" could wrongly advance the
+    merge). Existing True flags are never cleared.
     """
     text = (detail or "").lower()
-    wants_primary = "primary" in text
-    wants_other = "other" in text or "secondary" in text
-    wants_both = "both" in text or (not wants_primary and not wants_other)
+    wants_both = "both" in text
+    wants_primary = "primary" in text or wants_both
+    wants_other = "other" in text or "secondary" in text or wants_both
 
-    if wants_primary or wants_both:
+    if wants_primary:
         _set_state(state, "consent_primary", True)
-    if wants_other or wants_both:
+    if wants_other:
         _set_state(state, "consent_other", True)
 
 

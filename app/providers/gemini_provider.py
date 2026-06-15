@@ -24,7 +24,13 @@ from typing import Any
 from ..config import settings
 from ..prompts.system_prompt import build_state_context, build_system_text
 from ..tools import REGISTRY, dispatch
-from .base import RENDER_GUARD_MESSAGE, BaseProvider, fallback_reply
+from .base import (
+    ESCALATION_GUARD_MESSAGE,
+    RENDER_GUARD_MESSAGE,
+    SUMMARY_SYSTEM_PROMPT,
+    BaseProvider,
+    fallback_reply,
+)
 
 try:
     from google import genai
@@ -38,6 +44,8 @@ except ImportError:  # pragma: no cover - exercised only when SDK is absent
 
 _DRAFT_TOOL = "render_email_template"
 _ELIGIBILITY_TOOL = "evaluate_merge_eligibility"
+_OUTCOME_TOOL = "record_outcome"
+_ESCALATE_EVENT = "escalated_to_ops"
 _STATE_TOOLS = frozenset({"evaluate_merge_eligibility", "record_outcome"})
 
 # HTTP status codes worth retrying on the next model in the chain. 404 is
@@ -268,6 +276,35 @@ class GeminiProvider(BaseProvider):
             for t in transcript
         ]
 
+    async def summarize(self, text: str) -> str:
+        if not self.available():
+            return ""
+        client = self._get_client()
+        config = types.GenerateContentConfig(
+            system_instruction=SUMMARY_SYSTEM_PROMPT,
+            max_output_tokens=4000,
+            temperature=0,
+        )
+        last_exc: Exception | None = None
+        for model in (settings.gemini_model_list or [self.model_name()]):
+            try:
+                resp = client.aio.models.generate_content(
+                    model=model, contents=text, config=config
+                )
+                if inspect.isawaitable(resp):
+                    resp = await resp
+                # A truncated summary would silently lose the tail — signal failure.
+                cand = (getattr(resp, "candidates", None) or [None])[0]
+                if "MAX_TOKENS" in str(getattr(cand, "finish_reason", "")):
+                    return ""
+                return (getattr(resp, "text", "") or "").strip()
+            except Exception as exc:  # noqa: BLE001 — try the next model
+                last_exc = exc
+                continue
+        if last_exc:
+            raise last_exc
+        return ""
+
     # -- main loop ----------------------------------------------------------
 
     async def stream_turn(self, session: Any, user_message: str):
@@ -294,10 +331,16 @@ class GeminiProvider(BaseProvider):
         model_idx = 0  # current working model; sticks once a round succeeds
         last_draft_template: str | None = None
         any_tool_ran = False
-        # Render guard (see base.RENDER_GUARD_MESSAGE).
-        recommended_template: str | None = None
+        # Per-turn terminal-state tracking (mirrors the Anthropic provider's
+        # finalizer): enforce the engine's required follow-up, and show at most one
+        # form per turn with the draft card winning over a suppressed intake card.
+        required_followup: dict | None = None
         draft_rendered = False
-        render_forced = False
+        escalation_recorded = False
+        eligibility_decided = False
+        guard_forced = False
+        draft_form: dict | None = None
+        intake_form: dict | None = None
 
         try:
             while True:
@@ -382,26 +425,31 @@ class GeminiProvider(BaseProvider):
                     contents.append(types.Content(role="model", parts=model_parts))
 
                 if not fn_calls:
-                    # Safety net: decided an eligibility that needs a template but
-                    # stopped without drafting it — force one render round.
-                    if recommended_template and not draft_rendered and not render_forced:
-                        render_forced = True
-                        contents.append(
-                            types.Content(
+                    # --- Turn finalizer (mirror of the Anthropic provider) ---
+                    if not guard_forced and required_followup:
+                        kind = required_followup.get("kind")
+                        if kind == "draft" and not draft_rendered:
+                            guard_forced = True
+                            contents.append(types.Content(
                                 role="user",
-                                parts=[
-                                    types.Part.from_text(
-                                        text=RENDER_GUARD_MESSAGE.format(
-                                            template=recommended_template
-                                        )
-                                    )
-                                ],
-                            )
-                        )
-                        continue
-                    # Some turns end with only tool calls and no narration. Never
-                    # leave the chat empty — add a short reply (also saved to the
-                    # transcript via assistant_text_total).
+                                parts=[types.Part.from_text(text=RENDER_GUARD_MESSAGE.format(
+                                    template=required_followup.get("template_id", "")))],
+                            ))
+                            continue
+                        if kind == "escalate" and not escalation_recorded:
+                            guard_forced = True
+                            contents.append(types.Content(
+                                role="user",
+                                parts=[types.Part.from_text(text=ESCALATION_GUARD_MESSAGE)],
+                            ))
+                            continue
+                    # Emit at most one form: draft card wins; intake card suppressed
+                    # once a draft/decision exists.
+                    if draft_form is not None:
+                        yield {"event": "form", "data": draft_form}
+                    elif intake_form is not None and not draft_rendered and not eligibility_decided:
+                        yield {"event": "form", "data": intake_form}
+                    # Never leave the chat empty.
                     if not assistant_text_total.strip():
                         fallback = fallback_reply(last_draft_template, any_tool_ran)
                         if fallback:
@@ -434,6 +482,7 @@ class GeminiProvider(BaseProvider):
                     if name == _DRAFT_TOOL:
                         last_draft_template = result.get("template_id") or last_draft_template
                         draft_rendered = True
+                        draft_form = form_spec if isinstance(form_spec, dict) else None
                         yield {
                             "event": "draft",
                             "data": {
@@ -444,14 +493,21 @@ class GeminiProvider(BaseProvider):
                                 "warnings": result.get("warnings", []),
                             },
                         }
+                    elif isinstance(form_spec, dict):
+                        intake_form = form_spec
 
                     if name == _ELIGIBILITY_TOOL:
-                        rec = result.get("recommended_template_id")
-                        if rec:
-                            recommended_template = rec
+                        eligibility_decided = True
+                        followup = result.get("required_followup")
+                        if isinstance(followup, dict):
+                            required_followup = followup
 
-                    if isinstance(form_spec, dict):
-                        yield {"event": "form", "data": form_spec}
+                    if (
+                        name == _OUTCOME_TOOL
+                        and isinstance(args, dict)
+                        and args.get("event") == _ESCALATE_EVENT
+                    ):
+                        escalation_recorded = True
 
                     if name in _STATE_TOOLS:
                         yield {"event": "state", "data": _state_payload(session)}

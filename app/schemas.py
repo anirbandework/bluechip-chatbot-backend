@@ -177,6 +177,15 @@ class RenameChatRequest(BaseModel):
     title: str = Field(min_length=1, max_length=255)
 
 
+class CompactResult(BaseModel):
+    """Result of compacting a chat's context."""
+
+    folded: int  # messages folded into the summary this call
+    kept: int  # recent messages kept verbatim in the model context
+    total_messages: int  # full history size (all preserved in the DB)
+    has_summary: bool  # whether the chat now carries a compaction summary
+
+
 class AuditOut(BaseModel):
     id: uuid.UUID
     actor_email: str

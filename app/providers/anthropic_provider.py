@@ -15,10 +15,18 @@ from typing import Any
 from ..config import settings
 from ..prompts.system_prompt import build_state_context, build_system_prompt
 from ..tools import REGISTRY, dispatch
-from .base import RENDER_GUARD_MESSAGE, BaseProvider, fallback_reply
+from .base import (
+    ESCALATION_GUARD_MESSAGE,
+    RENDER_GUARD_MESSAGE,
+    SUMMARY_SYSTEM_PROMPT,
+    BaseProvider,
+    fallback_reply,
+)
 
 _DRAFT_TOOL = "render_email_template"
 _ELIGIBILITY_TOOL = "evaluate_merge_eligibility"
+_OUTCOME_TOOL = "record_outcome"
+_ESCALATE_EVENT = "escalated_to_ops"
 _STATE_TOOLS = frozenset({"evaluate_merge_eligibility", "record_outcome"})
 
 
@@ -57,6 +65,24 @@ class AnthropicProvider(BaseProvider):
         """Rebuild Anthropic messages from the neutral transcript."""
         return [{"role": t["role"], "content": t["text"]} for t in transcript]
 
+    async def summarize(self, text: str) -> str:
+        client = self._get_client()
+        msg = await client.messages.create(
+            model=settings.CLAUDE_MODEL,
+            max_tokens=4000,
+            system=SUMMARY_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": text}],
+        )
+        # A truncated summary would silently lose the tail; signal failure so the
+        # compaction boundary does not advance.
+        if getattr(msg, "stop_reason", None) == "max_tokens":
+            return ""
+        return "".join(
+            getattr(b, "text", "")
+            for b in msg.content
+            if getattr(b, "type", None) == "text"
+        ).strip()
+
     async def stream_turn(self, session: Any, user_message: str):
         import anthropic
 
@@ -75,11 +101,18 @@ class AnthropicProvider(BaseProvider):
         assistant_text = ""
         last_draft_template: str | None = None
         any_tool_ran = False
-        # Render guard: a decided eligibility with a recommended template MUST
-        # produce a draft. If the model stops without one, force a render once.
-        recommended_template: str | None = None
+        # Per-turn terminal-state tracking. The deterministic engine may declare a
+        # required follow-up (draft a template, or escalate to Program Ops); the
+        # finalizer enforces whichever is owed. At most ONE form is shown per turn
+        # — the draft card wins, and an intake card is suppressed once a decision
+        # or draft exists (so prose and card can never contradict).
+        required_followup: dict | None = None
         draft_rendered = False
-        render_forced = False
+        escalation_recorded = False
+        eligibility_decided = False
+        guard_forced = False
+        draft_form: dict | None = None   # latest render's fill-in card (None if complete)
+        intake_form: dict | None = None  # latest intake card
 
         try:
             while True:
@@ -111,27 +144,39 @@ class AnthropicProvider(BaseProvider):
                 )
 
                 if final_message.stop_reason != "tool_use":
-                    # Safety net: the model decided an eligibility that needs a
-                    # specific template but stopped without drafting it. Force one
-                    # render round so the draft is never silently skipped.
-                    if recommended_template and not draft_rendered and not render_forced:
-                        render_forced = True
-                        messages.append(
-                            {
+                    # --- Turn finalizer (deterministic terminal state) ---
+                    # 1. Enforce the required follow-up the engine declared, so a
+                    #    decided case always produces its draft / escalation rather
+                    #    than just narration. Forced once (guard_forced) — no loop.
+                    if not guard_forced and required_followup:
+                        kind = required_followup.get("kind")
+                        if kind == "draft" and not draft_rendered:
+                            guard_forced = True
+                            messages.append({
                                 "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": RENDER_GUARD_MESSAGE.format(
-                                            template=recommended_template
-                                        ),
-                                    }
-                                ],
-                            }
-                        )
-                        continue
-                    # Never leave the chat empty when the model returns only tool
-                    # calls / a draft with no narration.
+                                "content": [{
+                                    "type": "text",
+                                    "text": RENDER_GUARD_MESSAGE.format(
+                                        template=required_followup.get("template_id", "")
+                                    ),
+                                }],
+                            })
+                            continue
+                        if kind == "escalate" and not escalation_recorded:
+                            guard_forced = True
+                            messages.append({
+                                "role": "user",
+                                "content": [{"type": "text", "text": ESCALATION_GUARD_MESSAGE}],
+                            })
+                            continue
+                    # 2. Emit AT MOST ONE form. The draft card wins; the intake card
+                    #    is suppressed once a draft/decision exists (never show a
+                    #    "gather more facts" card that contradicts the reply).
+                    if draft_form is not None:
+                        yield {"event": "form", "data": draft_form}
+                    elif intake_form is not None and not draft_rendered and not eligibility_decided:
+                        yield {"event": "form", "data": intake_form}
+                    # 3. Never leave the chat empty.
                     if not assistant_text.strip():
                         fallback = fallback_reply(last_draft_template, any_tool_ran)
                         if fallback:
@@ -170,6 +215,10 @@ class AnthropicProvider(BaseProvider):
                     if block.name == _DRAFT_TOOL:
                         last_draft_template = result.get("template_id") or last_draft_template
                         draft_rendered = True
+                        # Latest render decides the fill-in card: the card when
+                        # fields are still missing, or None once the draft is
+                        # complete (so a complete re-render clears a stale card).
+                        draft_form = form_spec if isinstance(form_spec, dict) else None
                         yield {
                             "event": "draft",
                             "data": {
@@ -180,14 +229,22 @@ class AnthropicProvider(BaseProvider):
                                 "warnings": result.get("warnings", []),
                             },
                         }
+                    elif isinstance(form_spec, dict):
+                        # Any other tool that returns a form (request_intake_form).
+                        intake_form = form_spec
 
                     if block.name == _ELIGIBILITY_TOOL:
-                        rec = result.get("recommended_template_id")
-                        if rec:
-                            recommended_template = rec
+                        eligibility_decided = True
+                        followup = result.get("required_followup")
+                        if isinstance(followup, dict):
+                            required_followup = followup
 
-                    if isinstance(form_spec, dict):
-                        yield {"event": "form", "data": form_spec}
+                    if (
+                        block.name == _OUTCOME_TOOL
+                        and isinstance(tool_input, dict)
+                        and tool_input.get("event") == _ESCALATE_EVENT
+                    ):
+                        escalation_recorded = True
 
                     if block.name in _STATE_TOOLS:
                         yield {"event": "state", "data": _state_payload(session)}
