@@ -24,7 +24,7 @@ from typing import Any
 from ..config import settings
 from ..prompts.system_prompt import build_state_context, build_system_text
 from ..tools import REGISTRY, dispatch
-from .base import BaseProvider, fallback_reply
+from .base import RENDER_GUARD_MESSAGE, BaseProvider, fallback_reply
 
 try:
     from google import genai
@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover - exercised only when SDK is absent
     _GENAI_AVAILABLE = False
 
 _DRAFT_TOOL = "render_email_template"
+_ELIGIBILITY_TOOL = "evaluate_merge_eligibility"
 _STATE_TOOLS = frozenset({"evaluate_merge_eligibility", "record_outcome"})
 
 # HTTP status codes worth retrying on the next model in the chain. 404 is
@@ -293,11 +294,16 @@ class GeminiProvider(BaseProvider):
         model_idx = 0  # current working model; sticks once a round succeeds
         last_draft_template: str | None = None
         any_tool_ran = False
+        # Render guard (see base.RENDER_GUARD_MESSAGE).
+        recommended_template: str | None = None
+        draft_rendered = False
+        render_forced = False
 
         try:
             while True:
                 round_text = ""
                 fn_calls: list = []
+                fn_sigs: list = []
                 ri = model_idx
                 round_done = False
                 round_errors: list = []
@@ -306,6 +312,7 @@ class GeminiProvider(BaseProvider):
                     model = models[ri]
                     round_text = ""
                     fn_calls = []
+                    fn_sigs = []
                     emitted = False
                     try:
                         stream = client.aio.models.generate_content_stream(
@@ -323,6 +330,12 @@ class GeminiProvider(BaseProvider):
                                 fc = getattr(part, "function_call", None)
                                 if fc:
                                     fn_calls.append(fc)
+                                    # Preserve the thinking-model signature so the
+                                    # functionCall part can be echoed back: newer
+                                    # Gemini models REQUIRE it on the returned turn.
+                                    fn_sigs.append(
+                                        getattr(part, "thought_signature", None)
+                                    )
                         model_idx = ri  # stick with this working model
                         round_done = True
                         break
@@ -359,12 +372,33 @@ class GeminiProvider(BaseProvider):
                 model_parts: list = []
                 if round_text:
                     model_parts.append(types.Part.from_text(text=round_text))
-                for fc in fn_calls:
-                    model_parts.append(types.Part(function_call=fc))
+                for fc, sig in zip(fn_calls, fn_sigs):
+                    model_parts.append(
+                        types.Part(function_call=fc, thought_signature=sig)
+                        if sig is not None
+                        else types.Part(function_call=fc)
+                    )
                 if model_parts:
                     contents.append(types.Content(role="model", parts=model_parts))
 
                 if not fn_calls:
+                    # Safety net: decided an eligibility that needs a template but
+                    # stopped without drafting it — force one render round.
+                    if recommended_template and not draft_rendered and not render_forced:
+                        render_forced = True
+                        contents.append(
+                            types.Content(
+                                role="user",
+                                parts=[
+                                    types.Part.from_text(
+                                        text=RENDER_GUARD_MESSAGE.format(
+                                            template=recommended_template
+                                        )
+                                    )
+                                ],
+                            )
+                        )
+                        continue
                     # Some turns end with only tool calls and no narration. Never
                     # leave the chat empty — add a short reply (also saved to the
                     # transcript via assistant_text_total).
@@ -388,6 +422,10 @@ class GeminiProvider(BaseProvider):
                     except Exception as exc:  # one tool must not kill the stream
                         result = {"error": f"{type(exc).__name__}: {exc}"}
 
+                    # Pull any UI form directive out of the result — shown in the
+                    # chat as a `form` event, never echoed back to the model.
+                    form_spec = result.pop("form", None) if isinstance(result, dict) else None
+
                     yield {
                         "event": "tool_result",
                         "data": {"name": name, "output": result},
@@ -395,6 +433,7 @@ class GeminiProvider(BaseProvider):
 
                     if name == _DRAFT_TOOL:
                         last_draft_template = result.get("template_id") or last_draft_template
+                        draft_rendered = True
                         yield {
                             "event": "draft",
                             "data": {
@@ -405,6 +444,14 @@ class GeminiProvider(BaseProvider):
                                 "warnings": result.get("warnings", []),
                             },
                         }
+
+                    if name == _ELIGIBILITY_TOOL:
+                        rec = result.get("recommended_template_id")
+                        if rec:
+                            recommended_template = rec
+
+                    if isinstance(form_spec, dict):
+                        yield {"event": "form", "data": form_spec}
 
                     if name in _STATE_TOOLS:
                         yield {"event": "state", "data": _state_payload(session)}

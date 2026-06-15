@@ -137,10 +137,22 @@ async def render_email_template(tool_input: dict, session) -> dict:
                 seen.add(warning)
                 warnings.append(warning)
 
-    return {
+    result = {
         "template_id": template_id,
         "subject": subject,
         "body": body,
         "missing_fields": missing_fields,
         "warnings": warnings,
     }
+
+    # Surface any unfilled placeholders as an interactive "complete the draft"
+    # card (the provider emits result["form"] as a `form` SSE event and strips
+    # it from what the model sees).
+    if missing_fields:
+        from app.tools.forms import build_fields_form
+
+        form = build_fields_form(template_id, missing_fields)
+        if form is not None:
+            result["form"] = form
+
+    return result

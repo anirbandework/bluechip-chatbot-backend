@@ -14,6 +14,7 @@ from .. import db_models as dbm
 from ..db import SessionLocal, get_session
 from ..deps import has_permission, require_permission
 from ..models import ChatRequest
+from ..redact import CodeRedactor, scrub_codes
 from ..providers import default_provider_id, get_provider
 from ..schemas import (
     ChatDetail,
@@ -53,6 +54,7 @@ async def chat(
 
     async def event_stream():
         yield {"event": "session", "data": json.dumps({"session_id": chat_id})}
+        redactor = CodeRedactor()  # strip internal template codes (T1–T10) from agent-facing text
         try:
             if provider is None:
                 yield {
@@ -68,7 +70,20 @@ async def chat(
                 }
             else:
                 async for event in provider.stream_turn(session, message):
-                    yield {"event": event["event"], "data": json.dumps(event["data"])}
+                    if event["event"] == "token":
+                        clean = redactor.feed(event["data"].get("text", ""))
+                        if clean:
+                            yield {"event": "token", "data": json.dumps({"text": clean})}
+                    else:
+                        yield {"event": event["event"], "data": json.dumps(event["data"])}
+                tail = redactor.flush()
+                if tail:
+                    yield {"event": "token", "data": json.dumps({"text": tail})}
+                # Scrub the same codes from what gets persisted (so reloaded chats
+                # match what was shown).
+                for turn in session.transcript[prior_len:]:
+                    if turn.get("role") == "assistant" and turn.get("text"):
+                        turn["text"] = scrub_codes(turn["text"])
                 # Persist the turn with a fresh session (the request session may
                 # be closed by the time the stream finishes).
                 async with SessionLocal() as wdb:

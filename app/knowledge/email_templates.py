@@ -36,8 +36,7 @@ _CONTACT_OPENER: str = (
     "[If contact established] Thank you for your time over the phone.\n"
     "[If unable to reach the member after three attempts] We attempted to "
     "contact you on your registered mobile number {primary_phone} at {call_time}; "
-    "however, we were unable to get through as the call went {call_reason} "
-    "(e.g. Unanswered / not reachable)."
+    "however, we were unable to get through as the call went {call_reason}."
 )
 
 

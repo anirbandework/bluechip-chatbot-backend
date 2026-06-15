@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import account, eligibility, knowledge, masking, outcomes, templates
+from . import account, eligibility, forms, knowledge, masking, outcomes, templates
 
 # ---------------------------------------------------------------------------
 # Tool schemas (Anthropic format). input_schema fields match CONTRACTS §3.1-§3.5
@@ -26,6 +26,61 @@ from . import account, eligibility, knowledge, masking, outcomes, templates
 # ---------------------------------------------------------------------------
 
 REGISTRY: list[dict] = [
+    {
+        "name": "request_intake_form",
+        "description": (
+            "Show the agent an interactive, click-to-fill INTAKE CARD to collect "
+            "merge facts — but ONLY the facts the NEXT decision needs, never a "
+            "fixed 'ask everything' form. Pass `items` with just the checks you "
+            "still need (omit any the agent already gave). Because a name mismatch "
+            "alone denies the merge, START a fresh case by requesting only "
+            '["name_match"]; once the names match, request the remaining checks '
+            "you still need. PREFER THIS over asking for facts in prose. After "
+            "calling it, reply with ONE short line telling the agent to fill it in "
+            "and submit, then END your turn — do NOT call evaluate_merge_eligibility "
+            "or guess any fact; the agent's answers arrive as the next message. "
+            "SKIP this entirely if the agent already stated the facts."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": forms.INTAKE_ITEM_KEYS},
+                    "description": (
+                        "Which facts to collect — include ONLY what the next "
+                        "decision needs and that you don't already know. e.g. "
+                        '["name_match"] to start; once names match, '
+                        '["dob_match", "both_verified", "secondary_has_ibc_balance", '
+                        '"cobrand_linkage"]. Available: from_registered_email, '
+                        "name_match, dob_match, both_verified, "
+                        "secondary_has_ibc_balance, cobrand_linkage (auto-adds the "
+                        "issuing bank + make-Primary follow-ups), retain_mobile, "
+                        "merge_reason."
+                    ),
+                },
+                "account_details": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Also collect both accounts' raw details (membership no, "
+                        "name, DOB, mobile, email). Usually UNNECESSARY — the email "
+                        "draft collects the specific fields it needs. Set true only "
+                        "if you genuinely need the raw values now."
+                    ),
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional custom card title for the agent.",
+                },
+                "intro": {
+                    "type": "string",
+                    "description": "Optional one-line card description for the agent.",
+                },
+            },
+            "required": ["items"],
+        },
+    },
     {
         "name": "evaluate_merge_eligibility",
         "description": (
@@ -243,6 +298,9 @@ async def dispatch(name: str, tool_input: dict, session: Any) -> dict:
     ``tool_input`` is the already-parsed input dict from the model. An unknown
     tool name returns ``{"error": ...}`` rather than raising.
     """
+    if name == "request_intake_form":
+        return await forms.request_intake_form(tool_input, session)
+
     if name == "evaluate_merge_eligibility":
         return await eligibility.evaluate_merge_eligibility(tool_input, session)
 

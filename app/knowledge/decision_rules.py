@@ -76,7 +76,7 @@ def evaluate(
                 "Names registered on the two accounts do not match. Program "
                 "guidelines require the registered name to be consistent across "
                 "both accounts, so the merge cannot be processed. Send the "
-                "name-mismatch denial (T7)."
+                "name-mismatch denial email."
             ),
             "recommended_template_id": "T7",
             "requires_program_ops_discretion": False,
@@ -108,7 +108,7 @@ def evaluate(
                 "Verification (DPA / security-question check) on the other "
                 "IndiGo BluChip account could not be successfully completed, so "
                 "the merge cannot be processed. Send the verification-failed "
-                "denial (T5)."
+                "denial email."
             ),
             "recommended_template_id": "T5",
             "requires_program_ops_discretion": False,
@@ -139,7 +139,7 @@ def evaluate(
                 "Co-brand credit card privileges and benefits are linked to the "
                 "other (secondary) account. Merging as requested would "
                 "discontinue those benefits, so the merge cannot be processed as "
-                "is. Offer to make that account the Primary instead (T6)."
+                "is. Offer to make that account the Primary instead."
             ),
             "recommended_template_id": "T6",
             "requires_program_ops_discretion": False,

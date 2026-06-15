@@ -15,9 +15,10 @@ from typing import Any
 from ..config import settings
 from ..prompts.system_prompt import build_state_context, build_system_prompt
 from ..tools import REGISTRY, dispatch
-from .base import BaseProvider, fallback_reply
+from .base import RENDER_GUARD_MESSAGE, BaseProvider, fallback_reply
 
 _DRAFT_TOOL = "render_email_template"
+_ELIGIBILITY_TOOL = "evaluate_merge_eligibility"
 _STATE_TOOLS = frozenset({"evaluate_merge_eligibility", "record_outcome"})
 
 
@@ -74,6 +75,11 @@ class AnthropicProvider(BaseProvider):
         assistant_text = ""
         last_draft_template: str | None = None
         any_tool_ran = False
+        # Render guard: a decided eligibility with a recommended template MUST
+        # produce a draft. If the model stops without one, force a render once.
+        recommended_template: str | None = None
+        draft_rendered = False
+        render_forced = False
 
         try:
             while True:
@@ -105,6 +111,25 @@ class AnthropicProvider(BaseProvider):
                 )
 
                 if final_message.stop_reason != "tool_use":
+                    # Safety net: the model decided an eligibility that needs a
+                    # specific template but stopped without drafting it. Force one
+                    # render round so the draft is never silently skipped.
+                    if recommended_template and not draft_rendered and not render_forced:
+                        render_forced = True
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": RENDER_GUARD_MESSAGE.format(
+                                            template=recommended_template
+                                        ),
+                                    }
+                                ],
+                            }
+                        )
+                        continue
                     # Never leave the chat empty when the model returns only tool
                     # calls / a draft with no narration.
                     if not assistant_text.strip():
@@ -131,6 +156,12 @@ class AnthropicProvider(BaseProvider):
                     except Exception as exc:  # one tool must not kill the stream
                         result = {"error": f"{type(exc).__name__}: {exc}"}
 
+                    # Pull any UI form directive out of the result — it is shown
+                    # in the chat as a `form` event and never echoed back to the
+                    # model (it only needs the rest; re-sending the spec wastes
+                    # tokens). Works for any tool that returns a "form".
+                    form_spec = result.pop("form", None) if isinstance(result, dict) else None
+
                     yield {
                         "event": "tool_result",
                         "data": {"name": block.name, "output": result},
@@ -138,6 +169,7 @@ class AnthropicProvider(BaseProvider):
 
                     if block.name == _DRAFT_TOOL:
                         last_draft_template = result.get("template_id") or last_draft_template
+                        draft_rendered = True
                         yield {
                             "event": "draft",
                             "data": {
@@ -148,6 +180,14 @@ class AnthropicProvider(BaseProvider):
                                 "warnings": result.get("warnings", []),
                             },
                         }
+
+                    if block.name == _ELIGIBILITY_TOOL:
+                        rec = result.get("recommended_template_id")
+                        if rec:
+                            recommended_template = rec
+
+                    if isinstance(form_spec, dict):
+                        yield {"event": "form", "data": form_spec}
 
                     if block.name in _STATE_TOOLS:
                         yield {"event": "state", "data": _state_payload(session)}
