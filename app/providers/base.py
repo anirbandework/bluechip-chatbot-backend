@@ -55,6 +55,23 @@ ESCALATION_GUARD_MESSAGE = (
 )
 
 
+# Injected when the model ends a turn with NO reply at all (only thinking / tool
+# calls). Forces one more round so the agent gets a real answer — the "ask again
+# and it works" case — instead of a blank turn.
+EMPTY_REPLY_NUDGE = (
+    "SYSTEM: You ended your turn without any reply to the agent. Respond NOW in "
+    "plain language — answer the question, or summarize the outcome and the next "
+    "step. If you meant to use a tool, call it. Never return an empty turn."
+)
+
+# Last-resort reply so a turn is NEVER empty, even if the nudge also produced
+# nothing. Guarantees the UI always shows a response.
+EMPTY_TURN_FALLBACK = (
+    "Sorry — I didn't manage to put together a response just now. Please resend "
+    "your message or add a little more detail and I'll help."
+)
+
+
 def fallback_reply(draft_template: str | None, any_tool_ran: bool) -> str:
     """A short stand-in reply for turns that produced only tool calls / a draft
     with no narration — so the chat is never left empty. Returns ``""`` when

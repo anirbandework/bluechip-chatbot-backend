@@ -16,6 +16,8 @@ from ..config import settings
 from ..prompts.system_prompt import build_state_context, build_system_prompt
 from ..tools import REGISTRY, dispatch
 from .base import (
+    EMPTY_REPLY_NUDGE,
+    EMPTY_TURN_FALLBACK,
     ESCALATION_GUARD_MESSAGE,
     RENDER_GUARD_MESSAGE,
     SUMMARY_SYSTEM_PROMPT,
@@ -111,6 +113,7 @@ class AnthropicProvider(BaseProvider):
         escalation_recorded = False
         eligibility_decided = False
         guard_forced = False
+        empty_retry_done = False
         draft_form: dict | None = None   # latest render's fill-in card (None if complete)
         intake_form: dict | None = None  # latest intake card
 
@@ -169,6 +172,21 @@ class AnthropicProvider(BaseProvider):
                                 "content": [{"type": "text", "text": ESCALATION_GUARD_MESSAGE}],
                             })
                             continue
+                    # 1b. Empty-turn guard: the model produced NO reply (only
+                    #     thinking / tool calls) and nothing to confirm. Nudge it
+                    #     once to actually respond — this is the "ask again and it
+                    #     works" case — rather than ending the turn blank.
+                    if (
+                        not assistant_text.strip()
+                        and not draft_rendered
+                        and not empty_retry_done
+                    ):
+                        empty_retry_done = True
+                        messages.append({
+                            "role": "user",
+                            "content": [{"type": "text", "text": EMPTY_REPLY_NUDGE}],
+                        })
+                        continue
                     # 2. Emit AT MOST ONE form. The draft card wins; the intake card
                     #    is suppressed once a draft/decision exists (never show a
                     #    "gather more facts" card that contradicts the reply).
@@ -176,12 +194,15 @@ class AnthropicProvider(BaseProvider):
                         yield {"event": "form", "data": draft_form}
                     elif intake_form is not None and not draft_rendered and not eligibility_decided:
                         yield {"event": "form", "data": intake_form}
-                    # 3. Never leave the chat empty.
+                    # 3. A turn is NEVER empty: use the model's text, else a
+                    #    contextual fallback, else a guaranteed last-resort reply.
                     if not assistant_text.strip():
-                        fallback = fallback_reply(last_draft_template, any_tool_ran)
-                        if fallback:
-                            assistant_text += fallback
-                            yield {"event": "token", "data": {"text": fallback}}
+                        fallback = (
+                            fallback_reply(last_draft_template, any_tool_ran)
+                            or EMPTY_TURN_FALLBACK
+                        )
+                        assistant_text += fallback
+                        yield {"event": "token", "data": {"text": fallback}}
                     return
 
                 tool_results: list[dict] = []

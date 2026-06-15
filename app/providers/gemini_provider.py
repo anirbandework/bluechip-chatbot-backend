@@ -25,6 +25,8 @@ from ..config import settings
 from ..prompts.system_prompt import build_state_context, build_system_text
 from ..tools import REGISTRY, dispatch
 from .base import (
+    EMPTY_REPLY_NUDGE,
+    EMPTY_TURN_FALLBACK,
     ESCALATION_GUARD_MESSAGE,
     RENDER_GUARD_MESSAGE,
     SUMMARY_SYSTEM_PROMPT,
@@ -339,6 +341,7 @@ class GeminiProvider(BaseProvider):
         escalation_recorded = False
         eligibility_decided = False
         guard_forced = False
+        empty_retry_done = False
         draft_form: dict | None = None
         intake_form: dict | None = None
 
@@ -443,18 +446,32 @@ class GeminiProvider(BaseProvider):
                                 parts=[types.Part.from_text(text=ESCALATION_GUARD_MESSAGE)],
                             ))
                             continue
+                    # Empty-turn guard: nudge once if the model produced no reply.
+                    if (
+                        not assistant_text_total.strip()
+                        and not draft_rendered
+                        and not empty_retry_done
+                    ):
+                        empty_retry_done = True
+                        contents.append(types.Content(
+                            role="user",
+                            parts=[types.Part.from_text(text=EMPTY_REPLY_NUDGE)],
+                        ))
+                        continue
                     # Emit at most one form: draft card wins; intake card suppressed
                     # once a draft/decision exists.
                     if draft_form is not None:
                         yield {"event": "form", "data": draft_form}
                     elif intake_form is not None and not draft_rendered and not eligibility_decided:
                         yield {"event": "form", "data": intake_form}
-                    # Never leave the chat empty.
+                    # A turn is NEVER empty.
                     if not assistant_text_total.strip():
-                        fallback = fallback_reply(last_draft_template, any_tool_ran)
-                        if fallback:
-                            assistant_text_total += fallback
-                            yield {"event": "token", "data": {"text": fallback}}
+                        fallback = (
+                            fallback_reply(last_draft_template, any_tool_ran)
+                            or EMPTY_TURN_FALLBACK
+                        )
+                        assistant_text_total += fallback
+                        yield {"event": "token", "data": {"text": fallback}}
                     return  # turn complete
 
                 # Execute every function call and feed responses back.
